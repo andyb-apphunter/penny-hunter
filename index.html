@@ -77,7 +77,7 @@ nav{flex-wrap:wrap}body[data-page=add] #addp{display:none}.cand{background:var(-
 <main id="m"></main>
 <script>
 /* ===================== Penny Hunter: data and calculations ===================== */
-const VERSION = '0.8.2';
+const VERSION = '0.8.3';
 const PH = (() => {
   // ---------- dates (plain YYYY-MM-DD strings) ----------
   const p2 = n => String(n).padStart(2, '0');
@@ -438,6 +438,7 @@ const PH = (() => {
       series.push({ date: d, balance: r2(bal), items });
     }
     const accountsCheck = accountCheck(S, balances, availNames, tstart, held, newCard, planned, main, pendingBy);
+    const outlook = { quarter: outlookTo(S, availNames, pay, addMonths(t, 3), left), year: outlookTo(S, availNames, pay, addMonths(t, 12), left) };
     const warnings = [];
     for (const p of S.routine) if (!p.next) warnings.push(`${p.name} has no due date, so its $${p.amount.toFixed(2)} ${String(p.freq).toLowerCase()} isn't in the calculation. Add the date in Setup.`);
     for (const n of missing) warnings.push(`Enter a balance for ${n}.`);
@@ -460,7 +461,7 @@ const PH = (() => {
       sum: { available, other_income: r2(otherIncome), income_rows: incomeRows, held, new_card: newCard, pending, bills, planned, avail_names: availNames },
       entries: allEntries,
       wife: wife ? wife.name : null, wife_next: wn, wife_estimate: wife ? wife.amount : null, main_account: main ? main.account : null,
-      upcoming, unseen, budgets, series, warnings, to_review: toReview, accounts_check: accountsCheck, loan_check: loanCheck(S, tstart),
+      upcoming, unseen, budgets, series, warnings, to_review: toReview, accounts_check: accountsCheck, loan_check: loanCheck(S, tstart), outlook,
       position, trend: trend(S, tstart), categories: allCategories(S), budget_total: r2(budgets.reduce((s, b) => s + b.budget, 0)) };
   }
 
@@ -485,39 +486,75 @@ const PH = (() => {
     return out;
   }
 
+  // Looking further ahead: start from what's left at payday, then add each pay and take off each payment and each fortnight's budgets.
+  function outlookTo(S, availNames, pay, end, left) {
+    const card = new Set(S.accounts.filter(a => /credit/i.test(a.type || '')).map(a => a.name));
+    const ev = [], inc = {}, out = {};
+    const add = (g, k, name, amount, date, freq) => { const x = g[k] || (g[k] = { name, freq, amount: 0, times: 0, first: date }); x.amount = r2(x.amount + amount); x.times++; };
+    for (const i of S.income) {
+      if (!availNames.includes(i.account)) continue;
+      for (const d of occurrences(i.next, i.freq, pay, end)) { ev.push({ date: d, amount: i.amount }); add(inc, i.id || i.name, i.name, i.amount, d, i.freq); }
+    }
+    for (const p of S.routine) {
+      if (!availNames.includes(p.account)) continue;
+      const tr = String(p.type).toLowerCase() === 'transfer';
+      if (tr && (availNames.includes(p.to) || card.has(p.to))) continue;
+      for (const d of occurrences(p.next, p.freq, pay, end)) { if (p.next && d < p.next) continue; ev.push({ date: d, amount: -p.amount }); add(out, p.id || p.name, p.name, p.amount, d, p.freq); }
+    }
+    const fortnight = r2(S.budgets.reduce((s, b) => s + b.fortnight, 0));
+    let budgets = 0;
+    for (let d = pay; d < end; d = addDays(d, 14)) { const part = Math.min(14, diffDays(end, d)) / 14, amt = r2(fortnight * part); budgets = r2(budgets + amt); ev.push({ date: d, amount: -amt, budget: 1 }); }
+    ev.sort((a, b) => a.date.localeCompare(b.date) || (a.amount > 0 ? -1 : 1));
+    let run = left, low = left, lowDate = pay;
+    for (const e of ev) { run += e.amount; if (run < low - 0.004) { low = r2(run); lowDate = e.date; } }
+    const income = r2(Object.values(inc).reduce((s, x) => s + x.amount, 0)), bills = r2(Object.values(out).reduce((s, x) => s + x.amount, 0));
+    const regular = f => /^(weekly|fortnightly|monthly)$/i.test(f || '');
+    const sortBig = o => Object.values(o).sort((a, b) => b.amount - a.amount);
+    return { end, from: pay, left, income, bills, budgets, budget_fortnight: fortnight, result: r2(left + income - bills - budgets), low: r2(low), low_date: lowDate,
+      income_rows: sortBig(inc), bill_rows: sortBig(out), lumpy: Object.values(out).filter(x => !regular(x.freq)).sort((a, b) => a.first.localeCompare(b.first)) };
+  }
+
+  // The home loan: what's available in it now, plus money due in before the repayment, less the repayment.
+  const availKey = loan => loan + ' (available)';
   function loanCheck(S, tstart) {
     const t = today(), loan = (S.accounts.find(a => /loan/i.test(a.type || '')) || {}).name;
     if (!loan) return null;
-    const charges = S.routine.filter(p => p.account === loan && String(p.type).toLowerCase() === 'bill' && p.next)
-      .sort((a, b) => (/interest/i.test(b.name) - /interest/i.test(a.name)) || a.name.localeCompare(b.name));
+    const rank = p => /repay/i.test(p.name) ? 0 : /interest/i.test(p.name) ? 1 : 2;
+    const charges = S.routine.filter(p => p.account === loan && String(p.type).toLowerCase() === 'bill' && p.next).sort((a, b) => rank(a) - rank(b) || a.name.localeCompare(b.name));
     if (!charges.length) return null;
     const ch = charges[0];
-    const seen = txs().filter(x => x.account === loan && x.amount < 0 && /^INTEREST/i.test(x.description) && !/^INTEREST ADJ/i.test(x.description)).map(x => x.date);
+    const isCharge = x => x.account === loan && !x.manual && x.amount < 0 && !/ADJUSTMENT|REDRAW/i.test(x.description) && (hasText(x.description, routineMatch(ch)) || /^(INTEREST|LOAN REPAYMENT|REPAYMENT)/i.test(x.description));
+    const charged = txs().filter(isCharge), seen = charged.map(x => x.date);
+    // The repayment: learned from the last few repayments in the loan file (not the interest-only lines), otherwise the Setup amount.
+    const past = charged.filter(x => !/^INTEREST/i.test(x.description)).sort((a, b) => b.date.localeCompare(a.date)).slice(0, 3);
+    const amount = past.length ? r2(-past.reduce((s, x) => s + x.amount, 0) / past.length) : ch.amount;
     const due = occurrences(ch.next, ch.freq, t, addDays(t, 400)).find(d => !seen.some(x => Math.abs(diffDays(x, d)) <= 2));
     if (!due) return null;
-    const start = addDays(addMonths(due, -1), 1);
-    // Each scheduled payment into the loan is looked for in the loan's own lines first, then in the account it's paid from.
-    // If neither has it: before tracking began it's assumed paid, in the future it's expected, otherwise it's counted but flagged.
-    const credits = txs().filter(x => x.account === loan && !x.manual && x.amount > 0 && x.kind !== 'ignore' && x.date >= addDays(start, -4) && x.date <= due);
+    const cur = latestBalance(availKey(loan));
+    const from = cur ? (cur.date > t ? t : cur.date) : t;   // money in after this date isn't in the available figure yet
+    const credits = txs().filter(x => x.account === loan && !x.manual && x.amount > 0 && x.kind !== 'ignore' && x.date > addDays(from, -5) && x.date <= due);
     const used = new Set(), items = [];
-    const { occs } = matchRoutines(S, addDays(start, -7), addDays(due, 1));
+    const { occs } = matchRoutines(S, addDays(from, -7), addDays(due, 1));
     const sched = [];
-    for (const i of S.income.filter(i => i.account === loan)) for (const d of occurrences(i.next, i.freq, start, addDays(due, 1))) sched.push({ name: i.name, amount: i.amount, date: d, match: i.match });
-    for (const p of S.routine.filter(p => p.to === loan)) for (const d of occurrences(p.next, p.freq, start, addDays(due, 1))) sched.push({ name: p.name, amount: p.amount, date: d, routine: p });
+    for (const i of S.income.filter(i => i.account === loan)) for (const d of occurrences(i.next, i.freq, addDays(from, 1), addDays(due, 1))) sched.push({ name: i.name, amount: i.amount, date: d, match: i.match });
+    for (const p of S.routine.filter(p => p.to === loan)) for (const d of occurrences(p.next, p.freq, addDays(from, 1), addDays(due, 1))) sched.push({ name: p.name, amount: p.amount, date: d, routine: p });
     sched.sort((a, b) => a.date.localeCompare(b.date));
     for (const sc of sched) {
       const near = credits.filter(x => !used.has(x.key) && Math.abs(diffDays(x.date, sc.date)) <= 5 && Math.abs(x.amount - sc.amount) <= Math.max(sc.amount * 0.35, 1) && (!sc.match || hasText(x.description, sc.match)))
         .sort((x, y) => Math.abs(diffDays(x.date, sc.date)) - Math.abs(diffDays(y.date, sc.date)))[0];
-      if (near) { used.add(near.key); items.push({ date: near.date, name: sc.name, amount: near.amount, status: 'received' }); continue; }
+      if (near) { used.add(near.key); if (near.date > from) items.push({ date: near.date, name: sc.name, amount: near.amount, status: 'received' }); continue; }
       const paid = sc.routine && occs.find(o => o.p.id === sc.routine.id && o.tx && Math.abs(diffDays(o.tx.date, sc.date)) <= 5);
-      if (paid) { items.push({ date: paid.tx.date, name: sc.name, amount: -paid.tx.amount, status: 'paid_from', from: sc.routine.account }); continue; }
-      items.push({ date: sc.date, name: sc.name, amount: sc.amount, status: addDays(sc.date, -5) < tstart ? 'assumed' : sc.date >= t ? 'expected' : 'not_seen' });
+      if (paid) { if (paid.tx.date > from || sc.date > from) items.push({ date: paid.tx.date, name: sc.name, amount: -paid.tx.amount, status: 'paid_from', from: sc.routine.account }); continue; }
+      items.push({ date: sc.date, name: sc.name, amount: sc.amount, status: sc.date >= t ? 'expected' : 'not_seen' });
     }
-    // Anything else paid into the loan this month, such as an extra transfer.
-    for (const x of credits) if (!used.has(x.key) && x.date >= start) items.push({ date: x.date, name: 'Extra money in', amount: x.amount, status: 'received' });
+    for (const x of credits) if (!used.has(x.key) && x.date > from) items.push({ date: x.date, name: 'Extra money in', amount: x.amount, status: 'received' });
+    // Money taken out of the loan after the available figure was entered (redraws), so it's no longer there.
+    for (const x of txs()) if (x.account === loan && !x.manual && x.amount < 0 && x.date > from && x.date <= due && !isCharge(x) && !/ADJUSTMENT/i.test(x.description) && x.kind !== 'ignore') items.push({ date: x.date, name: 'Taken out', amount: x.amount, status: 'out' });
     items.sort((a, b) => a.date.localeCompare(b.date) || a.name.localeCompare(b.name));
-    const moneyIn = r2(items.reduce((s, x) => s + x.amount, 0)), gap = r2(ch.amount - moneyIn);
-    return { account: loan, charge: ch.name, amount: ch.amount, due, start, items, money_in: moneyIn, needed: Math.max(0, gap), spare: Math.max(0, -gap) };
+    const moneyIn = r2(items.reduce((s, x) => s + x.amount, 0)), current = cur ? r2(cur.amount) : 0;
+    const gap = r2(amount - current - moneyIn);
+    return { account: loan, charge: ch.name, amount, amount_from: past.length ? past.length : 0, setup_amount: ch.amount, due, current, current_date: cur ? cur.date : null, avail_key: availKey(loan),
+      items, money_in: moneyIn, needed: Math.max(0, gap), spare: Math.max(0, -gap) };
   }
 
   function trend(S, tstart) {
@@ -751,7 +788,15 @@ async function api(u, b) {
           .reverse().slice(0, 500).map(t => ({ ...t, id: t.key }));
         return { items, categories: PH.allCategories(S), accounts: S.accounts.map(a => a.name) };
       }
-      case '/api/accounts': return { accounts: S.accounts.map(a => ({ name: a.name, balance: PH.latestBalance(a.name, S) })), tracking_start: PH.trackingStart(S) };
+      case '/api/accounts': {
+        const list = [];
+        for (const a of S.accounts) {
+          const loan = /loan/i.test(a.type || '');
+          list.push({ name: a.name, label: loan ? a.name + ': owing' : a.name, balance: PH.latestBalance(a.name, S) });
+          if (loan) list.push({ name: a.name + ' (available)', label: a.name + ': available to redraw', extra: true, balance: PH.latestBalance(a.name + ' (available)', S) });
+        }
+        return { accounts: list, tracking_start: PH.trackingStart(S) };
+      }
       case '/api/import': return { results: b.files.map(f => { try { return PH.importFile(PH.setup(), f.name, f.text, f.account); } catch (e) { return { file: f.name, error: e.message }; } }) };
       case '/api/balances': PH.batch(() => { for (const [k, v] of Object.entries(b.balances)) if (v !== '' && v != null) PH.addBalance(k, parseFloat(String(v).replace(/[$,]/g, '')), PH.today(), 'entered'); }); return { ok: true };
       case '/api/answer': PH.answer(b.id, b.kind, b.category, b.note, !!b.always); return { ok: true };
@@ -790,7 +835,7 @@ m.innerHTML=`
 ${phoneBudgets(d)}
 ${d.to_review?`<div class="notice"><span>${d.to_review} transaction${d.to_review>1?'s':''} still need${d.to_review>1?'':'s'} an answer, so budgets may be understated.</span><button class="btn" id="goq">Answer questions</button></div>`:''}
 ${d.warnings.map(w=>`<div class="notice"><span>${esc(w)}</span></div>`).join('')}
-<section class="hero"><div>
+${hzChips()}<section class="hero" id="hero"><div>
 <div class="bigline ${good?'good':'short'}">${fmt(d.left)}</div>
 <div class="until">left until payday, ${dt(d.payday,{weekday:'long',day:'numeric',month:'long'})}</div>
 <div class="status ${good?'good':'short'}"><span aria-hidden="true">${good?'✓':'!'}</span>${good?'Enough for everything planned':'Short by '+fmt(-d.left)}</div>
@@ -807,17 +852,36 @@ ${d.unseen.length?`<section class="block"><h2>Expected but not seen</h2><p class
 <section class="two"><div><h2>Credit card</h2>${cardBlock(d)}</div><div><h2>Overall position</h2><p class="muted small">Property value isn't included.</p><table class="ledger">${d.position.accounts.map(a=>`<tr><td>${esc(a.name)}<br><span class="muted small">${a.date?'As at '+dt(a.date):'No balance yet'}</span></td><td>${a.amount==null?'':((a.type==='Loan'||a.type==='Credit card')?'-':'')+fmt(a.amount)}</td></tr>`).join('')}<tr><td><b style="font-weight:700">Overall</b></td><td><b>${fmt(d.position.net)}</b></td></tr></table></div></section>
 <section class="block"><h2>Spending by fortnight</h2><p class="muted small">All spending by category, including routine payments. Transfers and home loan interest aren't counted.</p><div id="tr"></div></section>`;
 const g=$('#goq');if(g)g.onclick=()=>{go('update');state.step=3;update()};
-runway(d);trendChart(d)}
+runway(d);trendChart(d);bindHz(d)}
 function meters(d){return d.budgets.map(b=>{const p=b.budget?b.spent/b.budget:0,cl=p>1?'over':p>.85?'warn':'';return`<div class="meter"><div class="row"><b style="font-weight:600">${esc(b.category)}</b><span class="num">${fmt(b.spent,0)} of ${fmt(b.budget,0)}</span></div><div class="track" role="img" aria-label="${esc(b.category)}: ${Math.round(p*100)}% of budget used"><div class="fill ${cl}" style="width:${Math.min(100,Math.max(0,p*100))}%"></div></div><div class="small ${p>1?'':'muted'}" style="${p>1?'color:var(--bad);font-weight:600':''}">${p>1?'! Over by '+fmt(b.spent-b.budget):fmt(b.left)+' left'}</div></div>`}).join('')}
 function phoneBudgets(d){if(!d.budgets.length)return'';const spent=d.budgets.reduce((a,b)=>a+b.spent,0),tot=d.budget_total,left=d.budgets.reduce((a,b)=>a+b.left,0),over=d.budgets.filter(b=>b.spent>b.budget),days=Math.round((new Date(d.payday)-new Date(d.today))/864e5);
 return `<section class="block phone-only pbud"><h2>Budgets this fortnight</h2><p class="muted small">${dt(d.period_start)} to ${dt(PH.addDays(d.payday,-1))}, ${days} day${days===1?'':'s'} to payday</p>
 <div class="ptot"><div><span class="muted small">Spent</span><b>${fmt(spent,0)}</b></div><div><span class="muted small">Budget</span><b>${fmt(tot,0)}</b></div><div><span class="muted small">Left</span><b style="color:${left>0?'var(--good)':'var(--bad)'}">${fmt(left,0)}</b></div></div>
 ${over.length?`<p class="small" style="color:var(--bad);font-weight:600;margin:4px 0 12px">! Over budget: ${over.map(b=>esc(b.category)).join(', ')}</p>`:''}<div style="margin-top:12px">${meters(d)}</div>
 <p class="small" style="margin-top:6px">Left until payday: <b style="color:${d.left>=0?'var(--good)':'var(--bad)'}">${fmt(d.left)}</b></p></section>`}
-function loanBlock(L){if(!L)return'';const ok=L.needed<=0;const st={received:'In the loan account',paid_from:'Paid from your account, not yet in the loan file',expected:'Expected',assumed:'Assumed paid, before tracking began',not_seen:'Not found in your bank files yet, counted anyway'};
-return `<section class="block"><h2>Home loan: ${esc(L.charge.toLowerCase())} on ${dt(L.due,{weekday:'long',day:'numeric',month:'long'})}</h2><p class="muted small">Money going in from ${dt(L.start)} to ${dt(L.due)}, compared with the usual charge. Transfers out of the loan aren't counted.</p>
-<div class="two" style="margin-top:12px"><div style="border:0;padding:0"><p class="${ok?'':''}" style="font:600 34px/1.1 var(--num);color:${ok?'var(--good)':'var(--bad)'}">${ok?'Nothing to add':fmt(L.needed)}</p><p style="margin-top:6px">${ok?`✓ Covered, with ${fmt(L.spare)} to spare`:`! Put this in before ${dt(L.due)}`}</p>
-<table class="sum" style="margin-top:14px"><tr><td>Money going in</td><td>${fmt(L.money_in)}</td></tr><tr><td>${esc(L.charge)}<small>From Setup</small></td><td>-${fmt(L.amount)}</td></tr><tr class="total"><td>${ok?'Spare':'Still needed'}</td><td>${fmt(ok?L.spare:-L.needed)}</td></tr></table></div>
+function hzChips(){const h=pref('hz')||'pay';return `<div class="chips hz" role="group" aria-label="Look ahead" style="margin-bottom:10px">${[['pay','Until payday'],['quarter','Next 3 months'],['year','Next 12 months']].map(([k,l])=>`<button class="chip ${h===k?'on':''}" data-hz="${k}" aria-pressed="${h===k}">${l}</button>`).join('')}</div>`}
+function bindHz(d){m.querySelectorAll('[data-hz]').forEach(x=>x.onclick=()=>{setPref('hz',x.dataset.hz);render(d)});const h=pref('hz');if(h==='quarter'||h==='year'){const e=$('#hero');if(e)e.outerHTML=outlookHero(d,h);const a=$('#addonce');if(a)a.onclick=()=>{state.stab='routine';go('setup');state.edit='new';state.prefill={freq:'Once',check:'No'};setupPage()}}}
+function outlookHero(d,h){const o=d.outlook[h],good=o.result>=0,net=o.income-o.bills-o.budgets,fn=Math.round(Math.max(0,(new Date(o.end)-new Date(o.from))/864e5)/14*10)/10;
+const det=(rows,neg)=>rows.length?`<details style="margin:4px 0 0"><summary class="small muted">Show ${rows.length}</summary><table class="ledger" style="margin-top:6px">${rows.map(x=>`<tr><td style="text-align:left">${esc(x.name)}<br><span class="muted small">${x.times>1?x.times+' times':dt(x.first)}</span></td><td>${neg?'-':''}${fmt(x.amount)}</td></tr>`).join('')}</table></details>`:'';
+return `<section class="hero" id="hero"><div>
+<div class="bigline ${good?'good':'short'}">${fmt(o.result)}</div>
+<div class="until">left by ${dt(o.end,{weekday:'long',day:'numeric',month:'long',year:'numeric'})}, after everything planned</div>
+<div class="status ${net>=0?'good':'short'}"><span aria-hidden="true">${net>=0?'✓':'!'}</span>${net>=0?'Up '+fmt(net)+' over this time':'Down '+fmt(-net)+' over this time'}</div>
+${o.low<0?`<p class="small" style="margin-top:10px;color:var(--bad);font-weight:600">! Lowest point ${fmt(o.low)} on ${dt(o.low_date)}, so money runs short before then.</p>`:`<p class="small muted" style="margin-top:10px">Lowest point ${fmt(o.low)} on ${dt(o.low_date)}.</p>`}
+${o.lumpy.length?`<h3 style="margin-top:16px;font-size:15px">Quarterly, yearly and one-off payments</h3><table class="ledger" style="margin-top:4px">${o.lumpy.map(x=>`<tr><td class="date">${dt(x.first)}</td><td style="text-align:left">${esc(x.name)}<br><span class="muted small">${esc(x.freq||'Once')}${x.times>1?', '+x.times+' times':''}</span></td><td>${fmt(x.amount)}</td></tr>`).join('')}</table>`:''}
+<button class="btn quiet" id="addonce" style="margin-top:12px">Add a one-off payment</button>
+</div>
+<table class="sum" aria-label="How this figure is worked out"><tr><td>Left at payday<small>${dt(o.from)}, as on the Until payday view</small></td><td>${fmt(o.left)}</td></tr>
+<tr><td>Pay and other income<small>Into your available accounts</small>${det(o.income_rows,false)}</td><td>${fmt(o.income)}</td></tr>
+<tr><td>Bills and payments<small>Including quarterly, yearly and one-off</small>${det(o.bill_rows,true)}</td><td>-${fmt(o.bills)}</td></tr>
+<tr><td>Budgets<small>About ${fn} fortnights at ${fmt(o.budget_fortnight,0)} each</small></td><td>-${fmt(o.budgets)}</td></tr>
+<tr class="total"><td>Left by ${dt(o.end)}</td><td>${fmt(o.result)}</td></tr></table><p class="muted small" style="grid-column:1/-1;margin-top:4px">Uses your Setup payments and budgets. Spending outside your budgets isn't included, so treat this as the best case.</p></section>`}
+function loanBlock(L){if(!L)return'';const ok=L.needed<=0;const st={received:'In the loan account',expected:'Expected',not_seen:'Not found in your bank files yet, counted anyway',out:'Taken out after the available figure'};
+const asat=L.current_date?'As at '+dt(L.current_date):'Not entered yet. Add it under Update, Balances';
+const src=L.amount_from?`Average of your last ${L.amount_from>1?L.amount_from+' repayments':'repayment'} in the loan file`:'From Setup, Payments';
+return `<section class="block"><h2>Home loan: repayment on ${dt(L.due,{weekday:'long',day:'numeric',month:'long'})}</h2><p class="muted small">What's available in the loan now, plus money due in before the repayment, less the repayment.</p>
+<div class="two" style="margin-top:12px"><div style="border:0;padding:0"><p style="font:600 34px/1.1 var(--num);color:${ok?'var(--good)':'var(--bad)'}">${ok?'Nothing to add':fmt(L.needed)}</p><p style="margin-top:6px">${ok?`✓ Covered, with ${fmt(L.spare)} to spare`:`! Put this in before ${dt(L.due)}`}</p>
+<table class="sum" style="margin-top:14px"><tr><td>Available in the loan now<small>${asat}</small></td><td>${fmt(L.current)}</td></tr><tr><td>Money going in<small>Rent and pay-day transfers before ${dt(L.due)}</small></td><td>${fmt(L.money_in)}</td></tr><tr><td>Repayment<small>${src}</small></td><td>-${fmt(L.amount)}</td></tr><tr class="total"><td>${ok?'Spare':'Still needed'}</td><td>${fmt(ok?L.spare:-L.needed)}</td></tr></table></div>
 <div style="border:0;padding:0"><table class="ledger">${L.items.map(x=>`<tr><td class="date">${dt(x.date)}</td><td>${esc(x.name)}<br><span class="muted small">${x.status==='paid_from'?'Paid from '+esc(x.from)+', not yet in the loan file':st[x.status]}</span></td><td>${fmt(x.amount)}</td></tr>`).join('')||'<tr><td>No money is scheduled to go in.</td></tr>'}</table></div></div></section>`}
 function cardBlock(d){const c=d.position.accounts.find(a=>a.type==='Credit card');return `<p class="bigcard" style="font:600 30px var(--num)">${c&&c.amount!=null?fmt(c.amount):'No balance yet'}</p><p class="muted small">Balance to clear${c&&c.date?', as at '+dt(c.date):''}</p><p style="margin-top:10px">New purchases this fortnight: ${fmt(d.sum.new_card)}<br><span class="muted small">Already counted in your budgets, so not taken off again.</span></p>${d.wife?`<p style="margin-top:10px">${esc(d.wife.replace(/'s salary/,"'s pay"))}: about ${fmt(d.wife_estimate,0)} on ${dt(d.wife_next)}, available for the card.</p>`:''}${d.sum.held?`<p>${fmt(d.sum.held)} is being held in the ${esc(d.main_account||'pay account')} for this.</p>`:''}`}
 function tipAt(box,x,y,h){let t=$('.tip',box);if(!t){t=document.createElement('div');t.className='tip';box.appendChild(t)}t.innerHTML=h;t.style.display='block';const w=t.offsetWidth,bw=box.clientWidth;t.style.left=Math.max(0,Math.min(bw-w,x+12))+'px';t.style.top=Math.max(0,y-t.offsetHeight-10)+'px'}
@@ -843,7 +907,7 @@ const c=$('.chart',box);box.querySelectorAll('.h').forEach(h=>{h.onpointermove=e
 /* ---------- update ---------- */
 async function update(){if(!state.step)state.step=1;const stepNames=['Add bank files','Check balances','Answer questions'];const head=`<h2 style="margin-bottom:12px">Update your money</h2><div class="steps">${stepNames.map((n,i)=>`<span class="${state.step===i+1?'on':state.step>i+1?'done':''}">${state.step>i+1?'✓ ':''}${i+1}. ${n}</span>`).join('')}</div>`;try{if(state.step===1)await stepFiles(head);else if(state.step===2)await stepBal(head);else await stepQ(head)}catch(e){fail(e)}}
 let pending=[];
-async function stepFiles(head){const a=await api('/api/accounts');const names=a.accounts.map(x=>x.name);
+async function stepFiles(head){const a=await api('/api/accounts');const names=a.accounts.filter(x=>!x.extra).map(x=>x.name);
 m.innerHTML=head+`<div class="panel"><p style="margin-bottom:12px">Download a CSV for each account you want to update, for any dates, then add them here. Transactions already imported are skipped. Transactions before ${dt(a.tracking_start,{day:'numeric',month:'long',year:'numeric'})} are left out.</p>
 <label class="drop" id="dz" tabindex="0"><input type="file" id="fi" accept=".csv,text/csv" multiple hidden><b style="font-weight:600">Drop CSV files here</b><br><span class="muted">or click to choose them</span></label><div id="fl" style="margin-top:12px"></div><p class="err" id="er" hidden></p><div class="actions"><button class="btn" id="imp" disabled>Import files</button><button class="btn quiet" id="skip">Skip to balances</button></div></div><div id="res"></div>`;
 const fl=$('#fl'),dz=$('#dz'),fi=$('#fi');function draw(){fl.innerHTML=pending.map((f,i)=>`<div class="filerow"><b>${esc(f.name)}</b><label class="small muted">Account <select data-i="${i}"><option value="">Choose…</option>${names.map(n=>`<option ${n===f.account?'selected':''}>${esc(n)}</option>`).join('')}</select></label><button class="btn quiet" data-x="${i}" style="padding:4px 10px">Remove</button></div>`).join('');fl.querySelectorAll('select').forEach(s=>s.onchange=()=>pending[+s.dataset.i].account=s.value);fl.querySelectorAll('[data-x]').forEach(b=>b.onclick=()=>{pending.splice(+b.dataset.x,1);draw()});$('#imp').disabled=!pending.length}
@@ -854,7 +918,7 @@ $('#skip').onclick=()=>{state.step=2;update()};
 $('#imp').onclick=async()=>{const er=$('#er');er.hidden=true;if(pending.some(f=>!f.account)){er.textContent='Choose an account for each file.';er.hidden=false;return}try{const r=await api('/api/import',{files:pending});state.importRes=r.results;const bad=r.results.filter(x=>x.error);pending=pending.filter(f=>bad.some(b=>b.file===f.name));draw();$('#res').innerHTML=`<div class="panel"><h3>Import results</h3><div class="wrap"><table class="datatable"><tr><th>File</th><th>Account</th><th class="num">Added</th><th class="num">Matched to your entries</th><th class="num">Already imported</th><th class="num">Before start date</th></tr>${r.results.map(x=>x.error?`<tr><td>${esc(x.file)}</td><td colspan="5" style="color:var(--bad)">! ${esc(x.error)}</td></tr>`:`<tr><td>${esc(x.file)}</td><td>${esc(x.account)}</td><td class="num">${x.new}</td><td class="num">${x.matched||0}</td><td class="num">${x.duplicates}</td><td class="num">${x.older}</td></tr>`).join('')}</table></div><div class="actions"><button class="btn" id="nb">Continue to balances</button></div></div>`;$('#nb').onclick=()=>{state.step=2;update()}}catch(e){er.textContent=e.message;er.hidden=false}}}
 function guess(n,t){try{const S=PH.setup(),b=PH.parseCSV(t).bank;const names=S.accounts.map(a=>a.name),f=re=>names.find(x=>re.test(x))||'';n=n.toLowerCase();if(b==='ING')return f(/\bING\b/i);if(b==='CommBank')return f(/commbank|commonwealth/i);if(n.includes('off'))return f(/offset/i);if(n.includes('loan'))return f(/loan/i);if(n.includes('credit')||n.includes('card'))return f(/credit|card/i)}catch{}return''}
 async function stepBal(head){const a=await api('/api/accounts');const tday=(await api('/api/dashboard')).today;
-m.innerHTML=head+`<div class="panel"><p style="margin-bottom:12px">Enter today's balance for each account. ING and CommBank fill in from their files. For the loan and card, enter what you owe as a positive number.</p><div class="fields">${a.accounts.map(x=>`<label for="b${esc(x.name)}">${esc(x.name)}</label><input type="text" inputmode="decimal" id="b${esc(x.name)}" data-a="${esc(x.name)}" placeholder="${x.balance?x.balance.amount.toFixed(2):'0.00'}" value="${x.balance&&x.balance.date===tday?x.balance.amount.toFixed(2):''}"><span class="muted small">${x.balance?'Last: '+fmt(x.balance.amount)+', '+dt(x.balance.date):'No balance yet'}</span>`).join('')}</div><p class="muted small" style="margin-top:10px">Leave a box empty to keep the last balance.</p><p class="err" id="er" hidden></p><div class="actions"><button class="btn" id="sv">Save balances</button><button class="btn quiet" id="bk">Back</button></div></div>`;
+m.innerHTML=head+`<div class="panel"><p style="margin-bottom:12px">Enter today's balance for each account. ING and CommBank fill in from their files. For the loan, enter what you owe (used for your overall position) and what's available to redraw (used for the repayment check). For the card, enter what you owe. Use positive numbers.</p><div class="fields">${a.accounts.map(x=>`<label for="b${esc(x.name)}">${esc(x.label||x.name)}</label><input type="text" inputmode="decimal" id="b${esc(x.name)}" data-a="${esc(x.name)}" placeholder="${x.balance?x.balance.amount.toFixed(2):'0.00'}" value="${x.balance&&x.balance.date===tday?x.balance.amount.toFixed(2):''}"><span class="muted small">${x.balance?'Last: '+fmt(x.balance.amount)+', '+dt(x.balance.date):'No balance yet'}</span>`).join('')}</div><p class="muted small" style="margin-top:10px">Leave a box empty to keep the last balance.</p><p class="err" id="er" hidden></p><div class="actions"><button class="btn" id="sv">Save balances</button><button class="btn quiet" id="bk">Back</button></div></div>`;
 $('#bk').onclick=()=>{state.step=1;update()};$('#sv').onclick=async()=>{const b={};let bad=false;m.querySelectorAll('[data-a]').forEach(i=>{const v=i.value.trim();if(v){if(isNaN(parseFloat(v.replace(/[$,]/g,''))))bad=true;else b[i.dataset.a]=v}});if(bad){$('#er').textContent='Enter balances as numbers, such as 3456.06.';$('#er').hidden=false;return}await api('/api/balances',{balances:b});state.step=3;update()}}
 const KINDS=[['spend','Spending'],['refund','Refund'],['income','Income'],['transfer','Transfer'],['ignore','Ignore']];
 async function stepQ(head){const r=await api('/api/review');const items=r.items,cats=r.categories;
@@ -887,7 +951,7 @@ function alertBox(t){const d=document.createElement('div');d.className='notice';
 let rz;addEventListener('resize',()=>{clearTimeout(rz);rz=setTimeout(()=>{if(page==='dash'&&state.d){runway(state.d);trendChart(state.d)}},200)});
 
 /* ===================== Setup and Settings screens ===================== */
-const FREQS = ['Weekly', 'Fortnightly', 'Monthly', 'Quarterly', 'Annually'];
+const FREQS = ['Weekly', 'Fortnightly', 'Monthly', 'Quarterly', 'Annually', 'Once'];
 const ACCOUNT_TYPES = ['Offset', 'Transaction', 'Savings', 'Loan', 'Credit card'];
 const MATCH_HELP = 'Words from the bank description, e.g. ORIGIN ENERGY. Separate alternatives with |.';
 function schema(tab) {
@@ -924,12 +988,13 @@ function setupPage() {
     .filter(r => !q || JSON.stringify(r).toLowerCase().includes(q));
   const cell = (r, [k, , t]) => { const v = r[k]; if (v === '' || v == null) return '<span class="muted">-</span>'; if (t === 'money') return fmt(+v); if (t === 'date') return dt(v, { day: 'numeric', month: 'short', year: 'numeric' }); return esc(v); };
   const extra = tab === 'budgets' ? PH.live('categories').filter(c => !rows.some(r => String(r.category).toLowerCase() === c.name.toLowerCase())) : [];
-  m.innerHTML = head + `<div class="panel"><div class="toolbar"><input type="search" id="sq" placeholder="Search ${sc.title.toLowerCase()}" value="${esc(state.sq || '')}" style="flex:1;min-width:180px" aria-label="Search"><button class="btn" id="add">Add ${sc.label}</button></div>
+  m.innerHTML = head + `<div class="panel"><div class="toolbar"><input type="search" id="sq" placeholder="Search ${sc.title.toLowerCase()}" value="${esc(state.sq || '')}" style="flex:1;min-width:180px" aria-label="Search">${tab === 'routine' ? '<button class="btn quiet" id="addf">Add a one-off payment</button>' : ''}<button class="btn" id="add">Add ${sc.label}</button></div>
   ${rows.length ? `<div class="wrap"><table class="datatable setup"><tr>${sc.cols.map(c => `<th class="${c[2] === 'money' ? 'num' : ''}">${c[1]}</th>`).join('')}<th></th></tr>${rows.map(r => `<tr class="${r.active === 'No' ? 'off' : ''}">${sc.cols.map(c => `<td class="${c[2] === 'money' ? 'num' : ''}">${cell(r, c)}${c[0] === 'name' && r.active === 'No' ? ' <span class="muted small">(inactive)</span>' : ''}${c[0] === 'name' && r.check === 'Yes' ? ' <span class="small" style="color:var(--warn)">Check</span>' : ''}</td>`).join('')}<td style="text-align:right"><button class="btn quiet sm" data-e="${esc(r.id)}">Edit</button></td></tr>`).join('')}</table></div>` : `<p class="muted">Nothing here yet. Choose Add ${sc.label}, or bring in your setup file from Settings.</p>`}
   ${extra.length ? `<h3 style="margin-top:18px">Categories added while answering questions</h3><p class="muted small">These have no budget. Add one to track them here.</p><div class="chips">${extra.map(c => `<button class="chip" data-nb="${esc(c.name)}">+ Budget for ${esc(c.name)}</button>`).join('')}</div>` : ''}</div>`;
   bindTabs();
   let tm; $('#sq').oninput = e => { state.sq = e.target.value; clearTimeout(tm); tm = setTimeout(() => { setupPage(); const i = $('#sq'); i.focus(); i.setSelectionRange(i.value.length, i.value.length); }, 300); };
   $('#add').onclick = () => { state.edit = 'new'; setupPage(); };
+  if ($('#addf')) $('#addf').onclick = () => { state.edit = 'new'; state.prefill = { freq: 'Once', check: 'No' }; setupPage(); };
   m.querySelectorAll('[data-e]').forEach(b => b.onclick = () => { state.edit = b.dataset.e; setupPage(); });
   m.querySelectorAll('[data-nb]').forEach(b => b.onclick = () => { state.edit = 'new'; state.prefill = { category: b.dataset.nb }; setupPage(); });
 }
@@ -945,7 +1010,7 @@ function editForm(head, tab) {
     else input = `<input type="${type === 'date' ? 'date' : 'text'}" ${type === 'num' ? 'inputmode="decimal"' : ''} id="${id}" value="${esc(v)}" style="width:100%">`;
     return `<label for="${id}">${label}</label><div>${input}${help ? `<p class="muted small" style="margin-top:3px">${esc(help)}</p>` : ''}</div>`;
   };
-  m.innerHTML = head + `<div class="panel" style="max-width:720px"><h3 style="margin-bottom:12px">${isNew ? 'Add ' + sc.label : 'Edit ' + esc(rec.name || rec.category)}</h3><div class="form">${sc.fields.map(field).join('')}</div><p class="err" id="er" hidden></p>
+  m.innerHTML = head + `<div class="panel" style="max-width:720px"><h3 style="margin-bottom:12px">${isNew ? (rec.freq === 'Once' ? 'Add a one-off payment' : 'Add ' + sc.label) : 'Edit ' + esc(rec.name || rec.category)}</h3>${isNew && rec.freq === 'Once' ? '<p class="muted small" style="margin:-6px 0 12px">Something due once, like car rego in six weeks. Set How often to Once and the due date. It comes off on that date and shows in the 3 and 12 month views.</p>' : ''}<div class="form">${sc.fields.map(field).join('')}</div><p class="err" id="er" hidden></p>
   <div class="actions"><button class="btn" id="sv">${isNew ? 'Add ' + sc.label : 'Save changes'}</button><button class="btn quiet" id="cx">Cancel</button>${isNew ? '' : `<span style="flex:1"></span><button class="btn quiet" id="dl">Delete</button>`}</div></div>`;
   bindTabs();
   const done = () => { state.edit = null; state.prefill = null; setupPage(); };
@@ -1196,7 +1261,7 @@ m.addEventListener('click', async e => {
 });
 
 
-const CHANGELOG="PENNY HUNTER - VERSION HISTORY\nWorking towards version 1.0.\n\n0.8.2 (13 Nov 2026) - Home loan check fix\n- Each expected payment into the loan is matched to the loan's own lines within a few days, so a payment posted a day or two away from its scheduled date is still found.\n- If the loan file doesn't show a repayment yet, it's taken from the account it was paid from.\n- Payments near the tracking start date are assumed paid, and any extra money paid in is listed separately.\n\n0.8.1 (13 Nov 2026) - Card purchases no longer taken off twice\n- Left until payday is now: balances, less bills due, less what's left in your budgets (and any entries not yet in a balance).\n- Card purchases count against their budgets only. The credit card section shows this fortnight's purchases for reference.\n- The account check follows the same rule.\n\n0.8.0 (13 Nov 2026) - Enter purchases as you go\n- New + Purchase button (bottom corner on the phone): where, amount, date, what you paid with and which budget.\n- Entries count towards budgets and the main figure straight away, and show who entered them.\n- Importing a CSV matches entries to the bank's lines automatically (same account and amount, within a week). Close matches are offered when you answer questions.\n- If a purchase is already in your bank files, the app offers to use that line instead.\n- Entries not found after a week are flagged, and can be deleted.\n\n0.7.1 (10 Nov 2026) - Phone layout\n- On the phone, budgets come first: spent, budget and left for the fortnight, any categories over budget, then each category.\n- The left-until-payday figure follows, with the rest of the dashboard below. The laptop layout is unchanged.\n\n0.7.0 (10 Nov 2026) - Web app for laptop and phone\n- Penny Hunter now runs in the browser and installs as an app on Windows and Android. No more building.\n- Setup is done in the app instead of an Excel file. Your old setup file can be brought in once.\n- Optional syncing between devices through a private GitHub gist, encrypted with your passphrase.\n- Old Penny Hunter data (transactions, answers and balances) can be brought in.\n- Personal matching words (names, payees) now live in your data, not in the app's code.\n- Download a backup copy at any time.\n\n0.6.1 (10 Nov 2026) - Account check matches the main figure\n- The account check now takes new card purchases and the rest of your budgets out of your pay account.\n- When an account is short, it shows any spare money in your other accounts.\n\n0.6.0 (7 Nov 2026) - Home loan check\n- Shows whether money going into the home loan covers the monthly charge, and how much to add if not.\n- Version numbers and this history.\n\n0.5.2 (7 Nov 2026) - Build fix for OneDrive folders.\n0.5.1 (7 Nov 2026) - Add a category while answering questions; fixed the file-drop box.\n0.5.0 (5 Nov 2026) - Renamed Penny Hunter, new icon and colours, account check added.\n0.4.0 (5 Nov 2026) - Windows program with its own window and shortcuts.\n0.3.0 (5 Nov 2026) - First working app: bank imports, left-until-payday figure, dashboard, guided update, transactions.\n0.2.0 - 0.2.2 (5 Nov 2026) - Regular payments found in statements, reviewed and confirmed; budgets set.\n0.1.0 (5 Nov 2026) - Setup file.\n\nSTILL TO DO FOR 1.0\n- Confirm the app installs and syncs on Windows and the phone.\n- Complete a first real update cycle and fix anything found.\n- Fill in remaining due dates and any quarterly or annual bills.\n- Keep chart colours fixed for each category.\n\nAFTER 1.0\n- Sharing with a partner.\n- Savings goals and debt tracking.\n";
+const CHANGELOG="PENNY HUNTER - VERSION HISTORY\nWorking towards version 1.0.\n\n0.8.3 (13 Nov 2026) - Home loan split, one-off payments, looking further ahead\n- The loan now has two balances under Update: what you owe (used only for your overall position) and what's available to redraw (used for the repayment check).\n- Repayment check is now: available now, plus rent and pay-day transfers due in before the repayment, less the repayment.\n- The repayment is the average of your last three repayments in the loan file, or the Setup amount if there are none yet.\n- Money taken out of the loan after you enter the available figure is taken off.\n- One-off payments: Setup, Payments, Add a one-off payment (or How often: Once) for anything due on a single date, like a bill in six weeks. It comes off on its due date.\n- The dashboard's main figure can now look ahead: Until payday, Next 3 months or Next 12 months.\n- The 3 and 12 month views start from what's left at payday, then add each pay and take off every bill (including quarterly, yearly and one-off ones) and each fortnight's budgets. They show where you'll end up, whether you're up or down over that time, and the lowest point along the way.\n\n0.8.2 (13 Nov 2026) - Home loan check fix\n- Each expected payment into the loan is matched to the loan's own lines within a few days, so a payment posted a day or two away from its scheduled date is still found.\n- If the loan file doesn't show a repayment yet, it's taken from the account it was paid from.\n- Payments near the tracking start date are assumed paid, and any extra money paid in is listed separately.\n\n0.8.1 (13 Nov 2026) - Card purchases no longer taken off twice\n- Left until payday is now: balances, less bills due, less what's left in your budgets (and any entries not yet in a balance).\n- Card purchases count against their budgets only. The credit card section shows this fortnight's purchases for reference.\n- The account check follows the same rule.\n\n0.8.0 (13 Nov 2026) - Enter purchases as you go\n- New + Purchase button (bottom corner on the phone): where, amount, date, what you paid with and which budget.\n- Entries count towards budgets and the main figure straight away, and show who entered them.\n- Importing a CSV matches entries to the bank's lines automatically (same account and amount, within a week). Close matches are offered when you answer questions.\n- If a purchase is already in your bank files, the app offers to use that line instead.\n- Entries not found after a week are flagged, and can be deleted.\n\n0.7.1 (10 Nov 2026) - Phone layout\n- On the phone, budgets come first: spent, budget and left for the fortnight, any categories over budget, then each category.\n- The left-until-payday figure follows, with the rest of the dashboard below. The laptop layout is unchanged.\n\n0.7.0 (10 Nov 2026) - Web app for laptop and phone\n- Penny Hunter now runs in the browser and installs as an app on Windows and Android. No more building.\n- Setup is done in the app instead of an Excel file. Your old setup file can be brought in once.\n- Optional syncing between devices through a private GitHub gist, encrypted with your passphrase.\n- Old Penny Hunter data (transactions, answers and balances) can be brought in.\n- Personal matching words (names, payees) now live in your data, not in the app's code.\n- Download a backup copy at any time.\n\n0.6.1 (10 Nov 2026) - Account check matches the main figure\n- The account check now takes new card purchases and the rest of your budgets out of your pay account.\n- When an account is short, it shows any spare money in your other accounts.\n\n0.6.0 (7 Nov 2026) - Home loan check\n- Shows whether money going into the home loan covers the monthly charge, and how much to add if not.\n- Version numbers and this history.\n\n0.5.2 (7 Nov 2026) - Build fix for OneDrive folders.\n0.5.1 (7 Nov 2026) - Add a category while answering questions; fixed the file-drop box.\n0.5.0 (5 Nov 2026) - Renamed Penny Hunter, new icon and colours, account check added.\n0.4.0 (5 Nov 2026) - Windows program with its own window and shortcuts.\n0.3.0 (5 Nov 2026) - First working app: bank imports, left-until-payday figure, dashboard, guided update, transactions.\n0.2.0 - 0.2.2 (5 Nov 2026) - Regular payments found in statements, reviewed and confirmed; budgets set.\n0.1.0 (5 Nov 2026) - Setup file.\n\nSTILL TO DO FOR 1.0\n- Confirm the app installs and syncs on Windows and the phone.\n- Complete a first real update cycle and fix anything found.\n- Fill in remaining due dates and any quarterly or annual bills.\n- Keep chart colours fixed for each category.\n\nAFTER 1.0\n- Sharing with a partner.\n- Savings goals and debt tracking.\n";
 $('#ver').textContent='v'+VERSION;$('#addp').onclick=()=>go('add');
 SYNC.onStatus(s=>{const e=$('#sync');e.textContent=s.text;e.className='sync'+(s.bad?' bad':'')});
 APP.onRemote=()=>{if(page==='dash'||page==='tx')go(page)};
